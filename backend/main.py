@@ -1,6 +1,6 @@
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import pandas as pd
 import numpy as np
 
@@ -16,6 +16,7 @@ app = FastAPI(
     description="AI-powered Bank Telemarketing Prediction API",
     version="2.0.0"
 )
+
 
 
 class Customer(BaseModel):
@@ -44,48 +45,44 @@ class Customer(BaseModel):
     euribor3m: float | None = None
     nr_employed: float | None = None
 
+    # Reject invalid customer age
+    @field_validator("age")
+    @classmethod
+    def validate_age(cls, value):
+        if value < 17 or value > 100:
+            raise ValueError("Enter a valid customer age between 17 and 100.")
+        return value
 
-# These are the same optional features used in your ML experiment.
-OPTIONAL_FEATURES = [
-    "contact", "month", "day_of_week", "campaign",
-    "pdays", "previous", "poutcome",
-    "emp.var.rate", "cons.price.idx", "cons.conf.idx",
-    "euribor3m", "nr.employed",
-    "was_previously_contacted",
-    "had_previous_campaign"
-]
+    # Reject empty or Swagger placeholder customer information
+    @field_validator(
+        "job", "marital", "education",
+        "default", "housing", "loan"
+    )
+    @classmethod
+    def validate_customer_fields(cls, value):
+        if not value or value.strip().lower() in [
+            "string", "none", "null", "undefined"
+        ]:
+            raise ValueError(
+                "Valid customer information is required. "
+                "Placeholder values are not accepted."
+            )
+        return value.strip()
 
-FEATURES = [
-    "age", "job", "marital", "education", "default",
-    "housing", "loan", "contact", "month", "day_of_week",
-    "campaign", "pdays", "previous", "poutcome",
-    "emp.var.rate", "cons.price.idx", "cons.conf.idx",
-    "euribor3m", "nr.employed",
-    "was_previously_contacted",
-    "had_previous_campaign"
-]
+    # Reject placeholder values in optional text fields too
+    @field_validator(
+        "contact", "month", "day_of_week", "poutcome"
+    )
+    @classmethod
+    def validate_optional_text(cls, value):
+        if value is not None and value.strip().lower() in [
+            "string", "none", "null", "undefined"
+        ]:
+            raise ValueError(
+                "Use null for missing information instead of placeholders."
+            )
+        return value.strip() if value is not None else None
 
-NUMERIC_FEATURES = [
-    "age", "campaign", "pdays", "previous",
-    "emp.var.rate", "cons.price.idx", "cons.conf.idx",
-    "euribor3m", "nr.employed",
-    "was_previously_contacted",
-    "had_previous_campaign"
-]
-
-# Thresholds selected using validation data.
-VALIDATION_THRESHOLDS = {
-    "Original XGBoost": {
-        "Complete": 0.73046,
-        "10% missing": 0.55532,
-        "25% missing": 0.55385
-    },
-    "Missingness-Aware V2": {
-        "40% missing": 0.66003,
-        "60% missing": 0.58101,
-        "100% missing": 0.49670
-    }
-}
 
 
 @app.get("/")
