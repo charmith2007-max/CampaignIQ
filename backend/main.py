@@ -1,5 +1,5 @@
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 import pandas as pd
 import numpy as np
@@ -11,15 +11,24 @@ from model_loader import (
     v2_preprocessor
 )
 
+
+# --------------------------------------------------
+# 1. FASTAPI APPLICATION
+# --------------------------------------------------
+
 app = FastAPI(
     title="CampaignIQ API",
     description="AI-powered Bank Telemarketing Prediction API",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 
+# --------------------------------------------------
+# 2. CUSTOMER INPUT MODEL
+# --------------------------------------------------
 
 class Customer(BaseModel):
+
     # Required customer information
     age: int
     job: str
@@ -45,21 +54,22 @@ class Customer(BaseModel):
     euribor3m: float | None = None
     nr_employed: float | None = None
 
-    # Reject invalid customer age
     @field_validator("age")
     @classmethod
     def validate_age(cls, value):
         if value < 17 or value > 100:
-            raise ValueError("Enter a valid customer age between 17 and 100.")
+            raise ValueError(
+                "Enter a valid customer age between 17 and 100."
+            )
         return value
 
-    # Reject empty or Swagger placeholder customer information
     @field_validator(
         "job", "marital", "education",
         "default", "housing", "loan"
     )
     @classmethod
     def validate_customer_fields(cls, value):
+
         if not value or value.strip().lower() in [
             "string", "none", "null", "undefined"
         ]:
@@ -67,26 +77,85 @@ class Customer(BaseModel):
                 "Valid customer information is required. "
                 "Placeholder values are not accepted."
             )
+
         return value.strip()
 
-    # Reject placeholder values in optional text fields too
     @field_validator(
         "contact", "month", "day_of_week", "poutcome"
     )
     @classmethod
     def validate_optional_text(cls, value):
+
         if value is not None and value.strip().lower() in [
             "string", "none", "null", "undefined"
         ]:
             raise ValueError(
-                "Use null for missing information instead of placeholders."
+                "Use null for missing information instead "
+                "of placeholder values."
             )
+
         return value.strip() if value is not None else None
 
 
+# --------------------------------------------------
+# 3. FEATURE DEFINITIONS
+# --------------------------------------------------
+
+OPTIONAL_FEATURES = [
+    "contact", "month", "day_of_week", "campaign",
+    "pdays", "previous", "poutcome",
+    "emp.var.rate", "cons.price.idx", "cons.conf.idx",
+    "euribor3m", "nr.employed",
+    "was_previously_contacted",
+    "had_previous_campaign"
+]
+
+
+FEATURES = [
+    "age", "job", "marital", "education", "default",
+    "housing", "loan", "contact", "month", "day_of_week",
+    "campaign", "pdays", "previous", "poutcome",
+    "emp.var.rate", "cons.price.idx", "cons.conf.idx",
+    "euribor3m", "nr.employed",
+    "was_previously_contacted",
+    "had_previous_campaign"
+]
+
+
+NUMERIC_FEATURES = [
+    "age", "campaign", "pdays", "previous",
+    "emp.var.rate", "cons.price.idx", "cons.conf.idx",
+    "euribor3m", "nr.employed",
+    "was_previously_contacted",
+    "had_previous_campaign"
+]
+
+
+# --------------------------------------------------
+# 4. VALIDATION THRESHOLDS
+# --------------------------------------------------
+
+VALIDATION_THRESHOLDS = {
+    "Original XGBoost": {
+        "Complete": 0.73046,
+        "10% missing": 0.55532,
+        "25% missing": 0.55385
+    },
+    "Missingness-Aware V2": {
+        "40% missing": 0.66003,
+        "60% missing": 0.58101,
+        "100% missing": 0.49670
+    }
+}
+
+
+# --------------------------------------------------
+# 5. HOME ENDPOINT
+# --------------------------------------------------
 
 @app.get("/")
 def home():
+
     return {
         "message": "Welcome to CampaignIQ API",
         "status": "running",
@@ -97,8 +166,13 @@ def home():
     }
 
 
+# --------------------------------------------------
+# 6. HEALTH CHECK
+# --------------------------------------------------
+
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy",
         "original_model_loaded": original_model is not None,
@@ -108,10 +182,15 @@ def health():
     }
 
 
+# --------------------------------------------------
+# 7. PREPARE CUSTOMER DATA
+# --------------------------------------------------
+
 def prepare_customer_data(customer):
+
     data = pd.DataFrame([customer.model_dump()])
 
-    # Match training dataset column names
+    # Rename API fields to match training dataset
     data = data.rename(columns={
         "emp_var_rate": "emp.var.rate",
         "cons_price_idx": "cons.price.idx",
@@ -119,24 +198,27 @@ def prepare_customer_data(customer):
         "nr_employed": "nr.employed"
     })
 
+    # Convert None to NaN
     data = data.replace({None: np.nan})
 
-    # Create the same engineered features used during training
+    # Engineer previous contact feature
     data["was_previously_contacted"] = np.where(
         data["pdays"].isna(),
         np.nan,
         (data["pdays"] != 999).astype(float)
     )
 
+    # Engineer previous campaign feature
     data["had_previous_campaign"] = np.where(
         data["previous"].isna(),
         np.nan,
         (data["previous"] > 0).astype(float)
     )
 
-    # Ensure exact training feature order
+    # Maintain exact training feature order
     data = data[FEATURES].copy()
 
+    # Convert numeric columns
     for column in NUMERIC_FEATURES:
         data[column] = pd.to_numeric(
             data[column],
@@ -146,8 +228,12 @@ def prepare_customer_data(customer):
     return data
 
 
+# --------------------------------------------------
+# 8. MODEL SELECTION
+# --------------------------------------------------
 
 def choose_model(data):
+
     missing_count = int(
         data[OPTIONAL_FEATURES].isna().sum().sum()
     )
@@ -159,87 +245,122 @@ def choose_model(data):
     ) * 100
 
     if missing_count <= 3:
-        # Original XGBoost: 0–3 missing fields
+
         model = original_model
         preprocessor = original_preprocessor
         model_name = "Original XGBoost"
 
         if missing_count == 0:
             scenario = "Complete"
-            threshold = 0.73046
-        elif missing_count <= 1:
+            threshold = VALIDATION_THRESHOLDS[
+                model_name
+            ]["Complete"]
+
+        elif missing_count == 1:
             scenario = "10% missing"
-            threshold = 0.55532
+            threshold = VALIDATION_THRESHOLDS[
+                model_name
+            ]["10% missing"]
+
         else:
             scenario = "25% missing"
-            threshold = 0.55385
+            threshold = VALIDATION_THRESHOLDS[
+                model_name
+            ]["25% missing"]
 
     else:
-        # V2: more than 3 missing fields
+
         model = v2_model
         preprocessor = v2_preprocessor
         model_name = "Missingness-Aware V2"
 
         if missing_count <= 7:
             scenario = "40% missing"
-            threshold = 0.66003
+            threshold = VALIDATION_THRESHOLDS[
+                model_name
+            ]["40% missing"]
+
         elif missing_count <= 11:
             scenario = "60% missing"
-            threshold = 0.58101
+            threshold = VALIDATION_THRESHOLDS[
+                model_name
+            ]["60% missing"]
+
         else:
             scenario = "100% missing"
-            threshold = 0.49670
+            threshold = VALIDATION_THRESHOLDS[
+                model_name
+            ]["100% missing"]
 
     return {
-        "supported": True,
         "model": model,
         "preprocessor": preprocessor,
         "model_name": model_name,
         "scenario": scenario,
         "threshold": threshold,
         "missing_count": missing_count,
-        "missing_percentage": round(missing_percentage, 2)
+        "missing_percentage": round(
+            missing_percentage, 2
+        )
     }
 
+
+# --------------------------------------------------
+# 9. PREDICTION ENDPOINT
+# --------------------------------------------------
 
 @app.post("/predict")
 def predict(customer: Customer):
 
     # Step 1: Prepare input
-    data = prepare_customer_data(customer)
+    try:
+        data = prepare_customer_data(customer)
 
-    # Step 2: Select model based on missing information
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Input preparation failed: {str(e)}"
+        )
+
+    # Step 2: Select model
     selection = choose_model(data)
-
-    # Do not silently apply an unvalidated routing rule
-    if not selection["supported"]:
-        return {
-            "status": "manual_review_required",
-            "message": (
-                "This missing-information pattern was not "
-                "directly evaluated during model validation."
-            ),
-            "missing_optional_fields": selection["missing_count"],
-            "missing_percentage": selection["missing_percentage"],
-            "prediction": None
-        }
 
     model = selection["model"]
     preprocessor = selection["preprocessor"]
 
-    # Step 3: Preprocess using the selected model's preprocessor
-    processed_data = preprocessor.transform(data)
+    if model is None or preprocessor is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Required ML model or preprocessor is not loaded."
+        )
 
-    # Step 4: Predict subscription probability
-    probability = float(
-        model.predict_proba(processed_data)[0][1]
+    # Step 3: Preprocess and predict
+    try:
+
+        processed_data = preprocessor.transform(data)
+
+        probability = float(
+            model.predict_proba(processed_data)[0][1]
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Unable to process customer information.",
+                "error": str(e)
+            }
+        )
+
+    # Step 4: Apply validation threshold
+    threshold = selection["threshold"]
+
+    prediction = int(
+        probability >= threshold
     )
 
-    # Step 5: Apply the selected validation threshold
-    threshold = selection["threshold"]
-    prediction = int(probability >= threshold)
-
-    # Step 6: Return result
+    # Step 5: Return prediction
     return {
         "status": "success",
         "selected_model": selection["model_name"],
@@ -252,8 +373,12 @@ def predict(customer: Customer):
             if prediction == 1
             else "Unlikely to Subscribe"
         ),
-        "subscription_probability": round(probability, 4),
-        "subscription_percentage": round(probability * 100, 2),
+        "subscription_probability": round(
+            probability, 4
+        ),
+        "subscription_percentage": round(
+            probability * 100, 2
+        ),
         "validation_threshold": threshold
     }
 
